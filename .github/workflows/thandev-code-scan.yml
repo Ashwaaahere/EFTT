@@ -1,0 +1,131 @@
+name: Thandev Code Scan
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+  pull_request:
+
+jobs:
+  code-scan:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      security-events: write   # optional, only needed if you upload SARIF to GitHub
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # -------------------------
+      # 1) Request GitHub OIDC token
+      # -------------------------
+      - name: Request OIDC token
+        id: oidc
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const core = require('@actions/core');
+            const token = await core.getIDToken('thandev');
+            core.setOutput('id_token', token);
+
+      # -------------------------
+      # 2) Exchange OIDC -> Thandev ingest token
+      # -------------------------
+      - name: Get Thandev ingest token
+        id: token
+        shell: bash
+        run: |
+          set -euo pipefail
+          RESP="$(curl -sS -X POST "${THANDEV_BASE_URL}/code-scans/oidc/exchange/github" \
+            -H "Content-Type: application/json" \
+            -d "{\"oidc_token\":\"${{ steps.oidc.outputs.id_token }}\"}")"
+          echo "$RESP"
+          ACCESS_TOKEN="$(python - <<'PY'
+import json,sys
+print(json.loads(sys.stdin.read())["access_token"])
+PY
+<<< "$RESP")"
+          echo "access_token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
+        env:
+          THANDEV_BASE_URL: ${{ vars.THANDEV_BASE_URL }}
+
+      # -------------------------
+      # 3) Install prerequisites
+      # -------------------------
+      - name: Install Python tools (Semgrep)
+        run: |
+          python -m pip install --upgrade pip
+          pip install semgrep
+
+      # -------------------------
+      # 4) Run Semgrep (SAST)
+      # -------------------------
+      - name: Semgrep (SAST)
+        shell: bash
+        run: |
+          semgrep scan --config=auto --json --output semgrep-output.json .
+
+      # -------------------------
+      # 5) Run Gitleaks (Secrets)
+      # -------------------------
+      - name: Gitleaks (Secrets)
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: detect --source . --report-format json --report-path gitleaks.json --no-git
+
+      # -------------------------
+      # 6) Run OSV-Scanner (SCA)
+      # -------------------------
+      - name: OSV-Scanner (Dependencies)
+        shell: bash
+        run: |
+          curl -sSfL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o osv-scanner
+          chmod +x ./osv-scanner
+          ./osv-scanner scan --format=json --output osv.json .
+
+      # -------------------------
+      # 7) Run Trivy FS (SCA + IaC/Misconfig)
+      # -------------------------
+      - name: Trivy FS (Vuln + Misconfig)
+        uses: aquasecurity/trivy-action@0.24.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          format: json
+          output: trivy.json
+          scanners: vuln,misconfig
+          ignore-unfixed: true
+
+      # -------------------------
+      # 8) Run Syft (SBOM)
+      # -------------------------
+      - name: Syft (SBOM - CycloneDX JSON)
+        uses: anchore/sbom-action@v0
+        with:
+          path: .
+          format: cyclonedx-json
+          output-file: syft_sbom.json
+
+      # -------------------------
+      # 9) Upload results to Thandev (Ingest)
+      # -------------------------
+      - name: Ingest to Thandev
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -sS -X POST "${THANDEV_BASE_URL}/code-scans/ingest" \
+            -H "Authorization: Bearer ${{ steps.token.outputs.access_token }}" \
+            -F "repo=${{ github.repository }}" \
+            -F "provider=github" \
+            -F "ref=${{ github.ref }}" \
+            -F "sha=${{ github.sha }}" \
+            -F "run_id=${{ github.run_id }}" \
+            -F "run_url=${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            -F "semgrep_json=@semgrep-output.json" \
+            -F "gitleaks_json=@gitleaks.json" \
+            -F "osv_json=@osv.json" \
+            -F "trivy_json=@trivy.json" \
+            -F "sbom_json=@syft_sbom.json"
+        env:
+          THANDEV_BASE_URL: ${{ vars.THANDEV_BASE_URL }}
