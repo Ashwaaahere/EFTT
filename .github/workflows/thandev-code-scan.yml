@@ -24,6 +24,15 @@ jobs:
             const token = await core.getIDToken('thandev');
             core.setOutput('id_token', token);
 
+      # Optional: verify code-scan API exists on backend
+      - name: Ping Thandev code-scan API
+        shell: bash
+        env:
+          THANDEV_BASE_URL: ${{ vars.THANDEV_BASE_URL }}
+        run: |
+          set -euo pipefail
+          curl -sS "${THANDEV_BASE_URL}/api/code-scans/ping" || true
+
       - name: Get Thandev ingest token
         id: token
         shell: bash
@@ -31,7 +40,7 @@ jobs:
           THANDEV_BASE_URL: ${{ vars.THANDEV_BASE_URL }}
         run: |
           set -euo pipefail
-          RESP="$(curl -sS -X POST "${THANDEV_BASE_URL}/code-scans/oidc/exchange/github" \
+          RESP="$(curl -sS -X POST "${THANDEV_BASE_URL}/api/code-scans/oidc/exchange/github" \
             -H "Content-Type: application/json" \
             -d "{\"oidc_token\":\"${{ steps.oidc.outputs.id_token }}\"}")"
           echo "Exchange response: $RESP"
@@ -81,7 +90,7 @@ jobs:
           THANDEV_BASE_URL: ${{ vars.THANDEV_BASE_URL }}
         run: |
           set -euo pipefail
-          curl -sS -X POST "${THANDEV_BASE_URL}/code-scans/ingest" \
+          curl -sS -X POST "${THANDEV_BASE_URL}/api/code-scans/ingest" \
             -H "Authorization: Bearer ${{ steps.token.outputs.access_token }}" \
             -F "repo=${{ github.repository }}" \
             -F "provider=github" \
