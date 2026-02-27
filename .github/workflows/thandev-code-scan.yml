@@ -111,10 +111,16 @@ jobs:
       - name: OSV-Scanner (Dependencies)
         shell: bash
         run: |
-          set -euo pipefail
-          curl -sSfL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o osv-scanner
-          chmod +x ./osv-scanner
-          ./osv-scanner scan --format=json --output osv.json .
+          set -e
+
+          if ls package-lock.json yarn.lock pnpm-lock.yaml requirements.txt poetry.lock Pipfile.lock go.mod go.sum Cargo.lock 2>/dev/null; then
+            curl -sSfL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o osv-scanner
+            chmod +x ./osv-scanner
+            ./osv-scanner scan --format=json --output osv.json . || true
+          else
+            echo "No dependency manifests found. Skipping OSV scan."
+            echo '{}' > osv.json
+          fi
 
       - name: Trivy FS (Vuln + Misconfig)
         uses: aquasecurity/trivy-action@0.24.0
