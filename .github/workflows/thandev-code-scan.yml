@@ -13,38 +13,49 @@ jobs:
       id-token: write
       contents: read
 
+    env:
+      THANDEV_BASE_URL: https://thandev-backend.fly.dev
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Request OIDC token
-        id: oidc
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const token = await core.getIDToken('thandev');
-            core.setOutput('id_token', token);
-
-      # Optional: verify code-scan API exists on backend
       - name: Ping Thandev code-scan API
         shell: bash
-        env:
-          THANDEV_BASE_URL: ${{ vars.THANDEV_BASE_URL }}
         run: |
           set -euo pipefail
-          curl -sS "${THANDEV_BASE_URL}/api/code-scans/ping" || true
+          curl -sS "${THANDEV_BASE_URL}/api/code-scans/ping"
+
+      - name: Request OIDC token (GitHub native)
+        id: oidc
+        shell: bash
+        run: |
+          set -euo pipefail
+          URL="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=thandev"
+          TOK="$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$URL" \
+            | python -c "import sys,json; print(json.load(sys.stdin)['value'])")"
+          echo "id_token=$TOK" >> "$GITHUB_OUTPUT"
 
       - name: Get Thandev ingest token
         id: token
         shell: bash
-        env:
-          THANDEV_BASE_URL: ${{ vars.THANDEV_BASE_URL }}
         run: |
           set -euo pipefail
-          RESP="$(curl -sS -X POST "${THANDEV_BASE_URL}/api/code-scans/oidc/exchange/github" \
+          URL="${THANDEV_BASE_URL}/api/code-scans/oidc/exchange/github"
+          RESP="$(curl -sS -w "\nHTTP_STATUS=%{http_code}\n" -X POST "$URL" \
             -H "Content-Type: application/json" \
             -d "{\"oidc_token\":\"${{ steps.oidc.outputs.id_token }}\"}")"
-          echo "Exchange response: $RESP"
-          ACCESS_TOKEN="$(python -c "import json,sys; print(json.loads(sys.argv[1])['access_token'])" "$RESP")"
+
+          STATUS="$(echo "$RESP" | sed -n 's/^HTTP_STATUS=//p')"
+          BODY="$(echo "$RESP" | sed '/^HTTP_STATUS=/d')"
+
+          echo "Exchange HTTP: $STATUS"
+          echo "Exchange body: $BODY"
+
+          if [ "$STATUS" != "200" ]; then
+            exit 1
+          fi
+
+          ACCESS_TOKEN="$(python -c "import json,sys; print(json.loads(sys.argv[1])['access_token'])" "$BODY")"
           echo "access_token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
 
       - name: Install Semgrep
@@ -53,6 +64,7 @@ jobs:
           pip install semgrep
 
       - name: Semgrep (SAST)
+        shell: bash
         run: |
           semgrep scan --config=auto --json --output semgrep-output.json .
 
@@ -62,6 +74,7 @@ jobs:
           args: detect --source . --report-format json --report-path gitleaks.json --no-git
 
       - name: OSV-Scanner (Dependencies)
+        shell: bash
         run: |
           curl -sSfL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o osv-scanner
           chmod +x ./osv-scanner
@@ -86,11 +99,9 @@ jobs:
 
       - name: Ingest to Thandev
         shell: bash
-        env:
-          THANDEV_BASE_URL: ${{ vars.THANDEV_BASE_URL }}
         run: |
           set -euo pipefail
-          curl -sS -X POST "${THANDEV_BASE_URL}/api/code-scans/ingest" \
+          curl -sS -w "\nHTTP_STATUS=%{http_code}\n" -X POST "${THANDEV_BASE_URL}/api/code-scans/ingest" \
             -H "Authorization: Bearer ${{ steps.token.outputs.access_token }}" \
             -F "repo=${{ github.repository }}" \
             -F "provider=github" \
