@@ -13,11 +13,21 @@ jobs:
       id-token: write
       contents: read
 
-    env:
-      THANDEV_BASE_URL: https://thandev-backend.fly.dev
-
     steps:
       - uses: actions/checkout@v4
+
+      # Base URL: keep it simple & visible for users.
+      # You can still override via repo variable THANDEV_BASE_URL if you want.
+      - name: Set THANDEV_BASE_URL
+        id: base
+        shell: bash
+        run: |
+          set -euo pipefail
+          DEFAULT="https://thandev-backend.fly.dev"
+          BASE="${{ vars.THANDEV_BASE_URL }}"
+          if [ -z "${BASE}" ]; then BASE="$DEFAULT"; fi
+          echo "THANDEV_BASE_URL=$BASE" >> "$GITHUB_ENV"
+          echo "Using THANDEV_BASE_URL=$BASE"
 
       - name: Ping Thandev code-scan API
         shell: bash
@@ -25,6 +35,7 @@ jobs:
           set -euo pipefail
           curl -sS "${THANDEV_BASE_URL}/api/code-scans/ping"
 
+      # ✅ Get OIDC token using GitHub's native OIDC env vars (more reliable than github-script)
       - name: Request OIDC token (GitHub native)
         id: oidc
         shell: bash
@@ -35,6 +46,24 @@ jobs:
             | python -c "import sys,json; print(json.load(sys.stdin)['value'])")"
           echo "id_token=$TOK" >> "$GITHUB_OUTPUT"
 
+      # Debug token claims to diagnose aud/iss/nbf/exp issues
+      - name: Inspect OIDC token claims (debug)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json, base64
+          tok = """${{ steps.oidc.outputs.id_token }}"""
+          h,p,_ = tok.split(".")
+          def b64url(s):
+            s += "=" * (-len(s) % 4)
+            return base64.urlsafe_b64decode(s.encode())
+          header = json.loads(b64url(h))
+          payload = json.loads(b64url(p))
+          print("HEADER:", json.dumps({k: header.get(k) for k in ["alg","kid","typ"]}, indent=2))
+          print("PAYLOAD subset:", json.dumps({k: payload.get(k) for k in ["iss","aud","iat","nbf","exp","repository","ref","sha","actor","sub"]}, indent=2))
+          PY
+
       - name: Get Thandev ingest token
         id: token
         shell: bash
@@ -44,7 +73,6 @@ jobs:
           RESP="$(curl -sS -w "\nHTTP_STATUS=%{http_code}\n" -X POST "$URL" \
             -H "Content-Type: application/json" \
             -d "{\"oidc_token\":\"${{ steps.oidc.outputs.id_token }}\"}")"
-
           STATUS="$(echo "$RESP" | sed -n 's/^HTTP_STATUS=//p')"
           BODY="$(echo "$RESP" | sed '/^HTTP_STATUS=/d')"
 
@@ -52,6 +80,7 @@ jobs:
           echo "Exchange body: $BODY"
 
           if [ "$STATUS" != "200" ]; then
+            echo "OIDC exchange failed."
             exit 1
           fi
 
@@ -59,13 +88,16 @@ jobs:
           echo "access_token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
 
       - name: Install Semgrep
+        shell: bash
         run: |
+          set -euo pipefail
           python -m pip install --upgrade pip
           pip install semgrep
 
       - name: Semgrep (SAST)
         shell: bash
         run: |
+          set -euo pipefail
           semgrep scan --config=auto --json --output semgrep-output.json .
 
       - name: Gitleaks (Secrets)
@@ -76,6 +108,7 @@ jobs:
       - name: OSV-Scanner (Dependencies)
         shell: bash
         run: |
+          set -euo pipefail
           curl -sSfL https://github.com/google/osv-scanner/releases/latest/download/osv-scanner_linux_amd64 -o osv-scanner
           chmod +x ./osv-scanner
           ./osv-scanner scan --format=json --output osv.json .
