@@ -1,7 +1,7 @@
 #include "common.h"
 #include "crypto.h"
 
-/* Signal handler for graceful shutdown */
+/* Signal handler for graceful shutdown*/
 void signal_handler(int sig) {
     printf("\nReceived signal %d. Closing connection...\n", sig);
     exit(EXIT_SUCCESS);
@@ -161,5 +161,6 @@ int main(int argc, char *argv[]) {
     
     return EXIT_SUCCESS;
 }
+
 
 
