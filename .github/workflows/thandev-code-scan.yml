@@ -139,6 +139,20 @@ jobs:
           format: cyclonedx-json
           output-file: syft_sbom.json
 
+      - name: Verify artifacts exist (debug)
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "=== workspace files ==="
+          ls -lah
+          echo "=== expected artifacts ==="
+          for f in semgrep-output.json gitleaks.json osv.json trivy.json syft_sbom.json; do
+            if [ -f "$f" ]; then
+              echo "✅ $f exists ($(wc -c < "$f") bytes)"
+            else
+              echo "❌ MISSING: $f"
+            fi
+          done
       - name: Ingest to Thandev
         shell: bash
         run: |
