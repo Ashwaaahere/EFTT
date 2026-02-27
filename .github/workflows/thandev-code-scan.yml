@@ -13,66 +13,70 @@ jobs:
       id-token: write
       contents: read
 
-    steps:
-      - uses: actions/checkout@v4
+    # ✅ Single source of truth (NOT a secret). Easy for users.
+    env:
+      THANDEV_BASE_URL: https://thandev-backend.fly.dev
 
-      # Base URL: keep it simple & visible for users.
-      # You can still override via repo variable THANDEV_BASE_URL if you want.
-      - name: Set THANDEV_BASE_URL
-        id: base
-        shell: bash
-        run: |
-          set -euo pipefail
-          DEFAULT="https://thandev-backend.fly.dev"
-          BASE="${{ vars.THANDEV_BASE_URL }}"
-          if [ -z "${BASE}" ]; then BASE="$DEFAULT"; fi
-          echo "THANDEV_BASE_URL=$BASE" >> "$GITHUB_ENV"
-          echo "Using THANDEV_BASE_URL=$BASE"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Ping Thandev code-scan API
         shell: bash
         run: |
           set -euo pipefail
-          curl -sS "${THANDEV_BASE_URL}/api/code-scans/ping"
+          echo "Pinging: ${THANDEV_BASE_URL}/api/code-scans/ping"
+          curl -sS -i "${THANDEV_BASE_URL}/api/code-scans/ping" | head -n 30 || true
 
-      # ✅ Get OIDC token using GitHub's native OIDC env vars (more reliable than github-script)
       - name: Request OIDC token (GitHub native)
         id: oidc
-        shell: bash
-        run: |
-          set -euo pipefail
-          URL="${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=thandev"
-          TOK="$(curl -sS -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$URL" \
-            | python -c "import sys,json; print(json.load(sys.stdin)['value'])")"
-          echo "id_token=$TOK" >> "$GITHUB_OUTPUT"
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const token = await core.getIDToken('thandev'); // aud=thandev
+            core.setOutput('id_token', token);
 
-      # Debug token claims to diagnose aud/iss/nbf/exp issues
       - name: Inspect OIDC token claims (debug)
         shell: bash
         run: |
           set -euo pipefail
+          TOKEN="${{ steps.oidc.outputs.id_token }}"
           python - <<'PY'
-          import json, base64
-          tok = """${{ steps.oidc.outputs.id_token }}"""
-          h,p,_ = tok.split(".")
-          def b64url(s):
+          import os, json, base64
+          t = os.environ["TOKEN"]
+          h,p,_ = t.split(".")
+          def b64(s):
             s += "=" * (-len(s) % 4)
-            return base64.urlsafe_b64decode(s.encode())
-          header = json.loads(b64url(h))
-          payload = json.loads(b64url(p))
+            return json.loads(base64.urlsafe_b64decode(s.encode()).decode())
+          header = b64(h)
+          payload = b64(p)
+          safe = {k: payload.get(k) for k in ["iss","aud","sub","repository","ref","sha","actor","iat","exp"]}
           print("HEADER:", json.dumps({k: header.get(k) for k in ["alg","kid","typ"]}, indent=2))
-          print("PAYLOAD subset:", json.dumps({k: payload.get(k) for k in ["iss","aud","iat","nbf","exp","repository","ref","sha","actor","sub"]}, indent=2))
+          print("PAYLOAD subset:", json.dumps(safe, indent=2))
           PY
+        env:
+          TOKEN: ${{ steps.oidc.outputs.id_token }}
 
-      - name: Get Thandev ingest token
+      - name: Get Thandev ingest token (OIDC exchange)
         id: token
         shell: bash
         run: |
           set -euo pipefail
+
           URL="${THANDEV_BASE_URL}/api/code-scans/oidc/exchange/github"
-          RESP="$(curl -sS -w "\nHTTP_STATUS=%{http_code}\n" -X POST "$URL" \
-            -H "Content-Type: application/json" \
-            -d "{\"oidc_token\":\"${{ steps.oidc.outputs.id_token }}\"}")"
+          echo "Exchange URL: $URL"
+
+          RESP="$(
+            curl -sS -w "\nHTTP_STATUS=%{http_code}\n" \
+              -X POST "$URL" \
+              -H "Content-Type: application/json" \
+              -d "$(python - <<'PY'
+          import json, os
+          print(json.dumps({"oidc_token": os.environ["OIDC_TOKEN"]}))
+          PY
+              )"
+          )"
+
           STATUS="$(echo "$RESP" | sed -n 's/^HTTP_STATUS=//p')"
           BODY="$(echo "$RESP" | sed '/^HTTP_STATUS=/d')"
 
@@ -80,7 +84,9 @@ jobs:
           echo "Exchange body: $BODY"
 
           if [ "$STATUS" != "200" ]; then
-            echo "OIDC exchange failed."
+            echo ""
+            echo "❌ OIDC exchange failed. This is backend-side (token verification)."
+            echo "   If you see RSAAlgorithm error, fix backend deps: use PyJWT (not jwt)."
             exit 1
           fi
 
@@ -88,16 +94,12 @@ jobs:
           echo "access_token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
 
       - name: Install Semgrep
-        shell: bash
         run: |
-          set -euo pipefail
           python -m pip install --upgrade pip
           pip install semgrep
 
       - name: Semgrep (SAST)
-        shell: bash
         run: |
-          set -euo pipefail
           semgrep scan --config=auto --json --output semgrep-output.json .
 
       - name: Gitleaks (Secrets)
@@ -134,7 +136,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -sS -w "\nHTTP_STATUS=%{http_code}\n" -X POST "${THANDEV_BASE_URL}/api/code-scans/ingest" \
+
+          URL="${THANDEV_BASE_URL}/api/code-scans/ingest"
+          echo "Ingest URL: $URL"
+
+          curl -sS -i -X POST "$URL" \
             -H "Authorization: Bearer ${{ steps.token.outputs.access_token }}" \
             -F "repo=${{ github.repository }}" \
             -F "provider=github" \
@@ -146,4 +152,5 @@ jobs:
             -F "gitleaks_json=@gitleaks.json" \
             -F "osv_json=@osv.json" \
             -F "trivy_json=@trivy.json" \
-            -F "sbom_json=@syft_sbom.json"
+            -F "sbom_json=@syft_sbom.json" \
+            | head -n 60
