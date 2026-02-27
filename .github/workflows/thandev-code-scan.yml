@@ -13,7 +13,6 @@ jobs:
       id-token: write
       contents: read
 
-    # ✅ Single source of truth (NOT a secret). Easy for users.
     env:
       THANDEV_BASE_URL: https://thandev-backend.fly.dev
 
@@ -33,14 +32,15 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            const token = await core.getIDToken('thandev'); // aud=thandev
+            const token = await core.getIDToken('thandev');
             core.setOutput('id_token', token);
 
       - name: Inspect OIDC token claims (debug)
         shell: bash
+        env:
+          TOKEN: ${{ steps.oidc.outputs.id_token }}
         run: |
           set -euo pipefail
-          TOKEN="${{ steps.oidc.outputs.id_token }}"
           python - <<'PY'
           import os, json, base64
           t = os.environ["TOKEN"]
@@ -54,27 +54,30 @@ jobs:
           print("HEADER:", json.dumps({k: header.get(k) for k in ["alg","kid","typ"]}, indent=2))
           print("PAYLOAD subset:", json.dumps(safe, indent=2))
           PY
-        env:
-          TOKEN: ${{ steps.oidc.outputs.id_token }}
 
       - name: Get Thandev ingest token (OIDC exchange)
         id: token
         shell: bash
+        env:
+          # ✅ THIS was missing in your run → KeyError + empty body (422)
+          OIDC_TOKEN: ${{ steps.oidc.outputs.id_token }}
         run: |
           set -euo pipefail
 
           URL="${THANDEV_BASE_URL}/api/code-scans/oidc/exchange/github"
           echo "Exchange URL: $URL"
 
+          JSON_BODY="$(python - <<'PY'
+          import json, os
+          print(json.dumps({"oidc_token": os.environ["OIDC_TOKEN"]}))
+          PY
+          )"
+
           RESP="$(
             curl -sS -w "\nHTTP_STATUS=%{http_code}\n" \
               -X POST "$URL" \
               -H "Content-Type: application/json" \
-              -d "$(python - <<'PY'
-          import json, os
-          print(json.dumps({"oidc_token": os.environ["OIDC_TOKEN"]}))
-          PY
-              )"
+              -d "$JSON_BODY"
           )"
 
           STATUS="$(echo "$RESP" | sed -n 's/^HTTP_STATUS=//p')"
@@ -84,9 +87,7 @@ jobs:
           echo "Exchange body: $BODY"
 
           if [ "$STATUS" != "200" ]; then
-            echo ""
-            echo "❌ OIDC exchange failed. This is backend-side (token verification)."
-            echo "   If you see RSAAlgorithm error, fix backend deps: use PyJWT (not jwt)."
+            echo "❌ OIDC exchange failed."
             exit 1
           fi
 
@@ -153,4 +154,4 @@ jobs:
             -F "osv_json=@osv.json" \
             -F "trivy_json=@trivy.json" \
             -F "sbom_json=@syft_sbom.json" \
-            | head -n 60
+            | head -n 80
